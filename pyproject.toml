@@ -18,6 +18,13 @@ dependencies = [
 [project.scripts]
 lunar-landing-site-selector = "lunar_landing_site_selector:main"
 
+[project.optional-dependencies]
+cv = [
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+    "ultralytics>=8.4.220",
+]
+
 [build-system]
 requires = ["uv_build>=0.13.10,<0.14.0"]
 build-backend = "uv_build"
