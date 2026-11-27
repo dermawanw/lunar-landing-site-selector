@@ -4,6 +4,7 @@ import sys
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+from scipy.signal import fftconvolve
 
 from lunar_landing_site_selector.ingest import LunarDEM, load_dem_roi
 from lunar_landing_site_selector.terrain_metrics import TerrainMetrics, compute_terrain_metrics
@@ -41,6 +42,17 @@ def pixel_to_latlon(row: int, col: int, dem: LunarDEM) -> tuple[float, float]:
     return float(lat), float(lon)
 
 
+def _zone_mean(arr: np.ndarray, dy_m: float, dx_m: float, radius_m: float) -> np.ndarray:
+    """Hitung rata-rata lokal di dalam cakram radius_m (meter) via konvolusi FFT."""
+    ry = int(np.ceil(radius_m / dy_m))
+    rx = int(np.ceil(radius_m / dx_m))
+    ky, kx = np.ogrid[-ry : ry + 1, -rx : rx + 1]
+    kernel = (np.hypot(ky * dy_m, kx * dx_m) < radius_m).astype(np.float64)
+    kernel /= kernel.sum()
+    clean = np.nan_to_num(arr.astype(np.float64), nan=0.0)
+    return fftconvolve(clean, kernel, mode="same")
+
+
 def select_landing_sites(
     dem: LunarDEM,
     metrics: TerrainMetrics,
@@ -50,7 +62,7 @@ def select_landing_sites(
     min_separation_m: float = 5000.0,
     top_n: int = 3,
 ) -> SelectionResult:
-    """Identifikasi zona aman dan pilih Top-N lokasi pendaratan terbaik."""
+    """Identifikasi zona aman dan pilih Top-N lokasi pendaratan berbasis skor rata-rata zona."""
     safe_mask = (
         np.isfinite(dem.elevation_m)
         & (metrics.slope_deg <= max_slope_deg)
@@ -74,12 +86,15 @@ def select_landing_sites(
     if not np.any(valid):
         return SelectionResult(safe_mask, safe_radius_m, score_map, [])
 
-    # Normalisasi skor hanya pada kandidat yang memenuhi radius aman minimum
+    # Hitung rata-rata slope & roughness pada seluruh cakram zona aman
+    zone_slope = _zone_mean(metrics.slope_deg, dem.dy_m, dem.dx_m, min_safe_radius_m)
+    zone_rough = _zone_mean(metrics.roughness_m, dem.dy_m, dem.dx_m, min_safe_radius_m)
+
     r_valid = safe_radius_m[valid]
     r_span = max(float(r_valid.max() - r_valid.min()), 1e-6)
     clearance_score = (r_valid - r_valid.min()) / r_span
-    slope_score = 1.0 - (metrics.slope_deg[valid] / max_slope_deg)
-    rough_score = 1.0 - (metrics.roughness_m[valid] / max_roughness_m)
+    slope_score = np.clip(1.0 - (zone_slope[valid] / max_slope_deg), 0.0, 1.0)
+    rough_score = np.clip(1.0 - (zone_rough[valid] / max_roughness_m), 0.0, 1.0)
 
     score_map[valid] = 0.50 * clearance_score + 0.30 * slope_score + 0.20 * rough_score
 
