@@ -1,4 +1,5 @@
 # Lunar Landing Site Selector
+[![CI](https://github.com/dermawanw/lunar-landing-site-selector/actions/workflows/ci.yml/badge.svg)](https://github.com/dermawanw/lunar-landing-site-selector/actions/workflows/ci.yml)
 
 A geospatial pipeline that processes NASA LRO LOLA / Kaguya **SLDEM2015** elevation data to identify safe lunar landing zones based on physical terrain constraints (slope, surface roughness, and hazard-free clearance radius).
 
