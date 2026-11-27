@@ -1,0 +1,29 @@
+[project]
+name = "lunar-landing-site-selector"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "dermawanw", email = "rizaldermawanw.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.5",
+    "plotly>=7.2.0",
+    "rasterio>=1.5.2",
+    "scipy>=1.18.1",
+]
+
+[project.scripts]
+lunar-landing-site-selector = "lunar_landing_site_selector:main"
+
+[build-system]
+requires = ["uv_build>=0.13.10,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "jupyter>=1.1.1",
+]
