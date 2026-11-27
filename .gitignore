@@ -15,3 +15,5 @@ data/processed/
 data/craters/
 runs/
 *.pt
+data/nac/
+outputs/_nac_crop_tmp.png
