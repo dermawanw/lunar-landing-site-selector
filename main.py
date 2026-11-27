@@ -7,7 +7,7 @@ from lunar_landing_site_selector.terrain_metrics import compute_terrain_metrics
 from lunar_landing_site_selector.visualize import plot_analysis_overview, plot_site_3d
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lunar Landing Site Selector Pipeline")
     parser.add_argument(
         "--dem",
@@ -23,11 +23,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("outputs"), help="Folder output visualisasi")
     parser.add_argument("--nac-geotiff", type=Path, default=None, help="Opsional: path GeoTIFF LROC NAC untuk refinement Rank #1")
     parser.add_argument("--nac-weights", type=Path, default=None, help="Opsional: path bobot YOLO (best.pt) untuk deteksi kawah pada crop NAC")
-    return parser.parse_args()
+    parser.add_argument("--nac-dem", type=Path, default=None, help="Opsional: path DEM resolusi tinggi untuk fusi slope pada crop NAC")
+    args = parser.parse_args(argv)
+    if args.nac_dem is not None and (args.nac_geotiff is None or args.nac_weights is None):
+        parser.error("--nac-dem membutuhkan --nac-geotiff dan --nac-weights")
+    return args
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
     print(f"[1/4] Loading DEM ROI: {args.dem}")
     dem = load_dem_roi(args.dem, window=(0, 0, 2048, 2048), scale_to_meters=args.scale)
@@ -88,6 +92,11 @@ def main() -> None:
         else:
             if not args.nac_weights.exists():
                 raise FileNotFoundError(f"YOLO weights tidak ditemukan: {args.nac_weights}")
+            if args.nac_dem is not None and not args.nac_dem.exists():
+                raise FileNotFoundError(f"NAC DEM tidak ditemukan: {args.nac_dem}")
+            nac_plot_path = args.out_dir / "nac_rank1_touchdown.png"
+            # shortcut: assumes --nac-dem is already in meters (dem_scale=1.0);
+            # add --nac-dem-scale if fusing non-meter high-res DEMs
             report = run_nac_touchdown(
                 args.nac_geotiff,
                 lat_deg=top_site.lat_deg,
@@ -95,8 +104,12 @@ def main() -> None:
                 weights_path=args.nac_weights,
                 half_span_m=args.min_radius,
                 tmp_image_path=args.out_dir / "_nac_crop_tmp.png",
+                output_plot_path=nac_plot_path,
                 tiled=True,
+                dem_path=args.nac_dem,
+                max_slope_deg=args.max_slope,
             )
+            print(f"Saved NAC plot    -> {nac_plot_path}")
             td = report.hazard.touchdown
             print(
                 f"NAC crop: {report.crop.image.shape[1]}x{report.crop.image.shape[0]} px "

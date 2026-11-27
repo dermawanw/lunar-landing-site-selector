@@ -123,3 +123,151 @@ def test_run_nac_touchdown_writes_plot_and_maps_latlon(tmp_path, monkeypatch):
     assert report.hazard.touchdown is not None
     assert report.touchdown_lat_deg is not None
     assert report.touchdown_lon_deg is not None
+
+
+def test_dem_slope_fusion_blocks_steep_region_and_shifts_touchdown(tmp_path, monkeypatch):
+    from rasterio.crs import CRS
+    from rasterio.warp import transform as warp_transform
+    import lunar_landing_site_selector.nac_georegister as nac_mod
+
+    lunar_eqc = CRS.from_proj4("+proj=eqc +R=1737400 +units=m +no_defs")
+    target_lat, target_lon = 27.0752, 1.5049
+    cx, cy = warp_transform(LUNAR_GEO_CRS, lunar_eqc, [target_lon], [target_lat])
+
+    # NAC 100x100 @ 2 m/px
+    nac_tif = tmp_path / "nac_eqc.tif"
+    with rasterio.open(
+        nac_tif, "w", driver="GTiff", height=100, width=100, count=1,
+        dtype=np.uint8, crs=lunar_eqc, transform=from_origin(cx[0] - 100.0, cy[0] + 100.0, 2.0, 2.0),
+    ) as dst:
+        dst.write(np.full((100, 100), 120, dtype=np.uint8), 1)
+
+    # DEM 50x50 @ 4 m/px (2x coarser): left half tilted 15 deg, right half flat 0 deg
+    dem_tif = tmp_path / "dem_eqc.tif"
+    cols = np.arange(50, dtype=np.float32)
+    profile = np.minimum(cols, 25.0) * 4.0 * np.tan(np.deg2rad(15.0))
+    dem_data = np.broadcast_to(profile[None, :], (50, 50)).astype(np.float32)
+    with rasterio.open(
+        dem_tif, "w", driver="GTiff", height=50, width=50, count=1,
+        dtype=np.float32, crs=lunar_eqc, transform=from_origin(cx[0] - 100.0, cy[0] + 100.0, 4.0, 4.0),
+    ) as dst:
+        dst.write(dem_data, 1)
+
+    def _no_craters(image_path, weights_path, conf=0.20):
+        return (100, 100), np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32)
+
+    monkeypatch.setattr(nac_mod, "detect_craters_yolo", _no_craters)
+    report = nac_mod.run_nac_touchdown(
+        nac_tif,
+        lat_deg=target_lat,
+        lon_deg=target_lon,
+        weights_path=tmp_path / "dummy.pt",
+        half_span_m=100.0,
+        tmp_image_path=tmp_path / "tmp.png",
+        dem_path=dem_tif,
+        max_slope_deg=5.0,
+    )
+
+    assert report.hazard.hazard_mask[:, :45].all()
+    assert not report.hazard.hazard_mask[:, 55:].any()
+    assert report.hazard.touchdown is not None
+    assert report.hazard.touchdown.col > 55
+
+
+def test_dem_without_overlap_raises_value_error(tmp_path):
+    from lunar_landing_site_selector.nac_georegister import compute_dem_slope_hazard
+
+    nac_tif = tmp_path / "nac.tif"
+    _write_synthetic_lunar_geotiff(nac_tif)
+    crop = extract_nac_window(nac_tif, lat_deg=27.0752, lon_deg=1.5049, half_span_m=400.0)
+
+    # DEM di belahan lain Bulan
+    far_dem = tmp_path / "far_dem.tif"
+    with rasterio.open(
+        far_dem, "w", driver="GTiff", height=20, width=20, count=1,
+        dtype=np.float32, crs=LUNAR_GEO_CRS, transform=from_origin(120.0, -10.0, 0.001, 0.001),
+    ) as dst:
+        dst.write(np.zeros((20, 20), dtype=np.float32), 1)
+
+    with pytest.raises(ValueError, match="does not overlap"):
+        compute_dem_slope_hazard(far_dem, crop, max_slope_deg=5.0)
+
+
+def _load_main_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "lunar_main_cli",
+        Path(__file__).resolve().parents[1] / "main.py",
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_main_cli_nac_dem_requires_geotiff_and_weights():
+    main_mod = _load_main_module()
+    with pytest.raises(SystemExit):
+        main_mod.parse_args(["--nac-dem", "dem.tif"])
+    with pytest.raises(SystemExit):
+        main_mod.parse_args(["--nac-geotiff", "nac.tif", "--nac-dem", "dem.tif"])
+
+
+def test_main_forwards_nac_dem_and_plot_path(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import lunar_landing_site_selector.nac_georegister as nac_mod
+
+    main_mod = _load_main_module()
+    nac_tif = tmp_path / "nac.tif"
+    weights = tmp_path / "best.pt"
+    nac_dem = tmp_path / "dem.tif"
+    for p in (nac_tif, weights, nac_dem):
+        p.write_bytes(b"stub")
+
+    fake_site = SimpleNamespace(
+        rank=1,
+        lat_deg=20.1908,
+        lon_deg=30.7717,
+        score=0.95,
+        safe_radius_m=500.0,
+        zone_mean_slope_deg=1.2,
+        zone_max_slope_deg=3.4,
+        zone_mean_roughness_m=0.8,
+        zone_hazard_pixels=0,
+    )
+    monkeypatch.setattr(main_mod, "load_dem_roi", lambda *a, **k: object())
+    monkeypatch.setattr(main_mod, "compute_terrain_metrics", lambda *a, **k: object())
+    monkeypatch.setattr(main_mod, "select_landing_sites", lambda *a, **k: SimpleNamespace(sites=[fake_site]))
+    monkeypatch.setattr(main_mod, "plot_analysis_overview", lambda *a, **k: tmp_path / "overview.png")
+    monkeypatch.setattr(main_mod, "plot_site_3d", lambda *a, **k: tmp_path / "site.html")
+
+    captured: dict = {}
+
+    def _fake_run_nac_touchdown(geotiff_path, **kwargs):
+        captured["geotiff_path"] = geotiff_path
+        captured.update(kwargs)
+        return SimpleNamespace(
+            crop=SimpleNamespace(image=np.zeros((10, 10), dtype=np.uint8), meters_per_px=0.5),
+            boxes_xyxy=np.empty((0, 4), dtype=np.float32),
+            hazard=SimpleNamespace(touchdown=None),
+            touchdown_lat_deg=None,
+            touchdown_lon_deg=None,
+        )
+
+    monkeypatch.setattr(nac_mod, "run_nac_touchdown", _fake_run_nac_touchdown)
+
+    out_dir = tmp_path / "out"
+    main_mod.main([
+        "--out-dir", str(out_dir),
+        "--max-slope", "7.5",
+        "--nac-geotiff", str(nac_tif),
+        "--nac-weights", str(weights),
+        "--nac-dem", str(nac_dem),
+    ])
+
+    assert captured["geotiff_path"] == nac_tif
+    assert captured["dem_path"] == nac_dem
+    assert captured["max_slope_deg"] == 7.5
+    assert captured["tiled"] is True
+    assert captured["output_plot_path"] == out_dir / "nac_rank1_touchdown.png"

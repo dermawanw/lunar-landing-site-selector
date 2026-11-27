@@ -5,7 +5,7 @@ import numpy as np
 import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import Affine
-from rasterio.warp import transform as warp_transform
+from rasterio.warp import Resampling, reproject, transform as warp_transform
 from rasterio.errors import WindowError
 from rasterio.windows import Window, from_bounds
 
@@ -137,6 +137,47 @@ def extract_nac_window(
     )
 
 
+def compute_dem_slope_hazard(
+    dem_path: str | Path,
+    crop: NacCrop,
+    max_slope_deg: float = 5.0,
+    scale_to_meters: float = 1.0,
+    band_index: int = 1,
+) -> np.ndarray:
+    """Reproyeksi DEM ke grid NacCrop dan buat masker bahaya untuk slope > max_slope_deg atau nodata."""
+    if max_slope_deg <= 0.0:
+        raise ValueError(f"max_slope_deg must be > 0, got {max_slope_deg}")
+    if scale_to_meters <= 0.0:
+        raise ValueError(f"scale_to_meters must be > 0, got {scale_to_meters}")
+    dem_p = Path(dem_path)
+    if not dem_p.is_file():
+        raise FileNotFoundError(f"DEM not found: {dem_p}")
+
+    dst_crs = crop.raster_crs if crop.raster_crs is not None else LUNAR_GEO_CRS
+    elev = np.full(crop.image.shape, np.nan, dtype=np.float64)
+
+    with rasterio.open(dem_p) as src:
+        src_crs = src.crs if src.crs is not None else LUNAR_GEO_CRS
+        reproject(
+            source=rasterio.band(src, band_index),
+            destination=elev,
+            src_crs=src_crs,
+            dst_transform=crop.window_transform,
+            dst_crs=dst_crs,
+            resampling=Resampling.bilinear,
+            dst_nodata=np.nan,
+        )
+
+    if not np.any(np.isfinite(elev)):
+        raise ValueError(f"DEM does not overlap NAC crop extent: {dem_p}")
+
+    elev_m = elev * float(scale_to_meters)
+    # shortcut: np.gradient on bilinearly resampled DEM; revisit if DEM is >10x coarser than NAC
+    dz_dy, dz_dx = np.gradient(elev_m, crop.dy_m, crop.dx_m)
+    slope_deg = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy)))
+    return (slope_deg > max_slope_deg) | ~np.isfinite(slope_deg)
+
+
 def run_nac_touchdown(
     geotiff_path: str | Path,
     lat_deg: float,
@@ -151,6 +192,9 @@ def run_nac_touchdown(
     tile_size: int = 640,
     overlap: int = 128,
     iou_threshold: float = 0.45,
+    dem_path: str | Path | None = None,
+    max_slope_deg: float = 5.0,
+    dem_scale: float = 1.0,
 ) -> NacTouchdownReport:
     """Ekstrak window NAC di koordinat Fase 1, jalankan deteksi kawah, lalu petakan touchdown ke (lat, lon)."""
     import matplotlib.image as mpimg
@@ -172,6 +216,14 @@ def run_nac_touchdown(
     else:
         shape, boxes, _ = detect_craters_yolo(tmp_path, weights_path, conf=conf)
     mask = rasterize_crater_hazards(shape, boxes, rim_margin_factor=rim_margin_factor)
+    if dem_path is not None:
+        slope_mask = compute_dem_slope_hazard(
+            dem_path,
+            crop,
+            max_slope_deg=max_slope_deg,
+            scale_to_meters=dem_scale,
+        )
+        mask = mask | slope_mask
     hazard = select_pinpoint_touchdown(mask, meters_per_px=crop.meters_per_px)
 
     td_lat: float | None = None
@@ -210,6 +262,9 @@ if __name__ == "__main__":
     parser.add_argument("--conf", type=float, default=0.20, help="YOLO confidence threshold.")
     parser.add_argument("--out-plot", type=Path, default=None, help="Optional path to save 3-panel touchdown overlay PNG.")
     parser.add_argument("--tiled", action="store_true", help="Use 640x640 sliding-window tiling + NMS for high-res crops.")
+    parser.add_argument("--dem", type=Path, default=None, help="Optional DEM GeoTIFF to fuse slope hazards onto NAC grid.")
+    parser.add_argument("--max-slope", type=float, default=5.0, help="Slope hazard threshold in degrees when --dem is provided.")
+    parser.add_argument("--dem-scale", type=float, default=1.0, help="Elevation scale factor to meters for --dem.")
     args = parser.parse_args()
 
     if args.weights is None:
@@ -228,6 +283,9 @@ if __name__ == "__main__":
             conf=args.conf,
             output_plot_path=args.out_plot,
             tiled=args.tiled,
+            dem_path=args.dem,
+            max_slope_deg=args.max_slope,
+            dem_scale=args.dem_scale,
         )
         if args.out_plot is not None:
             print(f"Saved plot       : {args.out_plot}")
