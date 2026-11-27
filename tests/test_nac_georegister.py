@@ -93,3 +93,33 @@ def test_projected_lunar_meter_crs_roundtrip(tmp_path):
     out_lat, out_lon = crop.pixel_to_latlon(mid_r, mid_c)
     assert abs(out_lat - target_lat) < 1e-4
     assert abs(out_lon - target_lon) < 1e-4
+
+
+def test_run_nac_touchdown_writes_plot_and_maps_latlon(tmp_path, monkeypatch):
+    import matplotlib.image as mpimg
+    import lunar_landing_site_selector.nac_georegister as nac_mod
+
+    tif_path = tmp_path / "synthetic_nac.tif"
+    _write_synthetic_lunar_geotiff(tif_path)
+
+    def _fake_yolo(image_path, weights_path, conf=0.20):
+        h, w = mpimg.imread(str(image_path)).shape[:2]
+        boxes = np.array([[5.0, 5.0, 15.0, 15.0]], dtype=np.float32)
+        return (h, w), boxes, np.array([0.9], dtype=np.float32)
+
+    monkeypatch.setattr(nac_mod, "detect_craters_yolo", _fake_yolo)
+    plot_path = tmp_path / "touchdown_plot.png"
+    report = nac_mod.run_nac_touchdown(
+        tif_path,
+        lat_deg=27.0752,
+        lon_deg=1.5049,
+        weights_path=tmp_path / "dummy.pt",
+        half_span_m=400.0,
+        tmp_image_path=tmp_path / "tmp_crop.png",
+        output_plot_path=plot_path,
+    )
+
+    assert plot_path.exists() and plot_path.stat().st_size > 0
+    assert report.hazard.touchdown is not None
+    assert report.touchdown_lat_deg is not None
+    assert report.touchdown_lon_deg is not None

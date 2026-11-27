@@ -12,7 +12,9 @@ from rasterio.windows import Window, from_bounds
 from lunar_landing_site_selector.micro_hazard import (
     MicroHazardResult,
     detect_craters_yolo,
+    detect_craters_yolo_tiled,
     rasterize_crater_hazards,
+    save_micro_hazard_plot,
     select_pinpoint_touchdown,
 )
 
@@ -40,9 +42,6 @@ class NacCrop:
         x_crs, y_crs = self.window_transform @ (float(col) + 0.5, float(row) + 0.5)
         if self.raster_crs is None or self.raster_crs == LUNAR_GEO_CRS:
             return float(y_crs), float(x_crs)
-        if self.raster_crs.is_geographic:
-            lon_out, lat_out = warp_transform(self.raster_crs, LUNAR_GEO_CRS, [x_crs], [y_crs])
-            return float(lat_out[0]), float(lon_out[0])
         lon_out, lat_out = warp_transform(self.raster_crs, LUNAR_GEO_CRS, [x_crs], [y_crs])
         return float(lat_out[0]), float(lon_out[0])
 
@@ -147,6 +146,11 @@ def run_nac_touchdown(
     conf: float = 0.20,
     rim_margin_factor: float = 1.1,
     tmp_image_path: str | Path = Path("outputs/_nac_crop_tmp.png"),
+    output_plot_path: str | Path | None = None,
+    tiled: bool = False,
+    tile_size: int = 640,
+    overlap: int = 128,
+    iou_threshold: float = 0.45,
 ) -> NacTouchdownReport:
     """Ekstrak window NAC di koordinat Fase 1, jalankan deteksi kawah, lalu petakan touchdown ke (lat, lon)."""
     import matplotlib.image as mpimg
@@ -156,7 +160,17 @@ def run_nac_touchdown(
     tmp_path.parent.mkdir(parents=True, exist_ok=True)
     mpimg.imsave(tmp_path, crop.image, cmap="gray")
 
-    shape, boxes, _ = detect_craters_yolo(tmp_path, weights_path, conf=conf)
+    if tiled:
+        shape, boxes, _ = detect_craters_yolo_tiled(
+            crop.image,
+            weights_path,
+            conf=conf,
+            tile_size=tile_size,
+            overlap=overlap,
+            iou_threshold=iou_threshold,
+        )
+    else:
+        shape, boxes, _ = detect_craters_yolo(tmp_path, weights_path, conf=conf)
     mask = rasterize_crater_hazards(shape, boxes, rim_margin_factor=rim_margin_factor)
     hazard = select_pinpoint_touchdown(mask, meters_per_px=crop.meters_per_px)
 
@@ -164,6 +178,16 @@ def run_nac_touchdown(
     td_lon: float | None = None
     if hazard.touchdown is not None:
         td_lat, td_lon = crop.pixel_to_latlon(hazard.touchdown.row, hazard.touchdown.col)
+
+    if output_plot_path is not None:
+        save_micro_hazard_plot(
+            tmp_path,
+            boxes,
+            hazard,
+            output_plot_path,
+            conf=conf,
+            meters_per_px=crop.meters_per_px,
+        )
 
     return NacTouchdownReport(
         crop=crop,
@@ -184,6 +208,8 @@ if __name__ == "__main__":
     parser.add_argument("--half-span-m", type=float, default=600.0, help="Half-width of crop around target in meters.")
     parser.add_argument("--weights", type=Path, default=None, help="Optional YOLO weights path for touchdown selection.")
     parser.add_argument("--conf", type=float, default=0.20, help="YOLO confidence threshold.")
+    parser.add_argument("--out-plot", type=Path, default=None, help="Optional path to save 3-panel touchdown overlay PNG.")
+    parser.add_argument("--tiled", action="store_true", help="Use 640x640 sliding-window tiling + NMS for high-res crops.")
     args = parser.parse_args()
 
     if args.weights is None:
@@ -200,7 +226,11 @@ if __name__ == "__main__":
             weights_path=args.weights,
             half_span_m=args.half_span_m,
             conf=args.conf,
+            output_plot_path=args.out_plot,
+            tiled=args.tiled,
         )
+        if args.out_plot is not None:
+            print(f"Saved plot       : {args.out_plot}")
         print(f"Crop shape       : {report.crop.image.shape[1]}x{report.crop.image.shape[0]} px ({report.crop.meters_per_px:.2f} m/px)")
         print(f"Detected craters : {len(report.boxes_xyxy)}")
         if report.hazard.touchdown is None:

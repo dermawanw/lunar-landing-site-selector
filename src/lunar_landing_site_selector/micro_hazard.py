@@ -118,6 +118,153 @@ def detect_craters_yolo(
     return (h, w), boxes, scores
 
 
+def _tile_origins(length: int, tile_size: int, overlap: int) -> list[int]:
+    if length <= tile_size:
+        return [0]
+    stride = tile_size - overlap
+    origins = list(range(0, length - tile_size, stride))
+    last = length - tile_size
+    if not origins or origins[-1] != last:
+        origins.append(last)
+    return origins
+
+
+def _nms_xyxy(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    iou_threshold: float = 0.45,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(boxes) == 0:
+        return np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32)
+
+    b = np.asarray(boxes, dtype=np.float32)
+    s = np.asarray(scores, dtype=np.float32)
+    areas = np.maximum(0.0, b[:, 2] - b[:, 0]) * np.maximum(0.0, b[:, 3] - b[:, 1])
+    order = np.argsort(s)[::-1]
+    keep: list[int] = []
+
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(b[i, 0], b[rest, 0])
+        yy1 = np.maximum(b[i, 1], b[rest, 1])
+        xx2 = np.minimum(b[i, 2], b[rest, 2])
+        yy2 = np.minimum(b[i, 3], b[rest, 3])
+        inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+        union = areas[i] + areas[rest] - inter
+        iou = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0.0)
+        order = rest[iou <= iou_threshold]
+
+    return b[keep], s[keep]
+
+
+def _to_rgb_uint8(image: np.ndarray | str | Path) -> np.ndarray:
+    if isinstance(image, (str, Path)):
+        img_p = Path(image)
+        if not img_p.is_file():
+            raise FileNotFoundError(f"Image not found: {img_p}")
+        import matplotlib.image as mpimg
+
+        arr = mpimg.imread(str(img_p))
+    else:
+        arr = np.asarray(image)
+
+    if arr.dtype != np.uint8:
+        arr_f = arr.astype(np.float32)
+        if arr_f.size > 0 and float(np.nanmax(arr_f)) <= 1.0:
+            arr_f = arr_f * 255.0
+        arr = np.clip(arr_f, 0.0, 255.0).astype(np.uint8)
+
+    if arr.ndim == 2:
+        return np.stack([arr, arr, arr], axis=-1)
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        # shortcut: passes RGB channels as-is; identical to BGR for grayscale lunar NAC
+        return arr[:, :, :3]
+    raise ValueError(f"Expected 2D or 3-channel image, got shape {arr.shape}")
+
+
+def _predict_tiles_yolo(
+    tiles: list[np.ndarray],
+    weights_path: Path,
+    conf: float,
+    imgsz: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"Weights not found: {weights_path}")
+
+    from ultralytics import YOLO
+
+    model = YOLO(str(weights_path))
+    outputs: list[tuple[np.ndarray, np.ndarray]] = []
+    for tile in tiles:
+        res = model.predict(source=tile, conf=conf, imgsz=imgsz, verbose=False)[0]
+        if res.boxes is None or len(res.boxes) == 0:
+            outputs.append((np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32)))
+        else:
+            outputs.append(
+                (
+                    res.boxes.xyxy.cpu().numpy().astype(np.float32),
+                    res.boxes.conf.cpu().numpy().astype(np.float32),
+                )
+            )
+    return outputs
+
+
+def detect_craters_yolo_tiled(
+    image: np.ndarray | str | Path,
+    weights_path: str | Path,
+    conf: float = 0.25,
+    tile_size: int = 640,
+    overlap: int = 128,
+    iou_threshold: float = 0.45,
+) -> tuple[tuple[int, int], np.ndarray, np.ndarray]:
+    """Jalankan YOLO dengan sliding-window tiles + IoU NMS untuk citra NAC beresolusi tinggi."""
+    if tile_size <= 0:
+        raise ValueError(f"tile_size must be > 0, got {tile_size}")
+    if overlap < 0 or overlap >= tile_size:
+        raise ValueError(f"overlap must satisfy 0 <= overlap < tile_size, got {overlap}")
+    if not (0.0 < iou_threshold <= 1.0):
+        raise ValueError(f"iou_threshold must be in (0, 1], got {iou_threshold}")
+
+    rgb = _to_rgb_uint8(image)
+    h, w = rgb.shape[:2]
+    ys = _tile_origins(h, tile_size, overlap)
+    xs = _tile_origins(w, tile_size, overlap)
+
+    tiles: list[np.ndarray] = []
+    offsets: list[tuple[int, int]] = []
+    for y0 in ys:
+        for x0 in xs:
+            tiles.append(rgb[y0 : min(y0 + tile_size, h), x0 : min(x0 + tile_size, w)])
+            offsets.append((x0, y0))
+
+    raw_preds = _predict_tiles_yolo(tiles, Path(weights_path), conf=conf, imgsz=tile_size)
+
+    all_boxes: list[np.ndarray] = []
+    all_scores: list[np.ndarray] = []
+    for (x0, y0), (boxes, scores) in zip(offsets, raw_preds):
+        if len(boxes) == 0:
+            continue
+        shifted = boxes.astype(np.float32).copy()
+        shifted[:, [0, 2]] += float(x0)
+        shifted[:, [1, 3]] += float(y0)
+        all_boxes.append(shifted)
+        all_scores.append(scores.astype(np.float32))
+
+    if not all_boxes:
+        return (h, w), np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32)
+
+    merged_boxes, merged_scores = _nms_xyxy(
+        np.concatenate(all_boxes, axis=0),
+        np.concatenate(all_scores, axis=0),
+        iou_threshold=iou_threshold,
+    )
+    return (h, w), merged_boxes, merged_scores
+
+
 def save_micro_hazard_plot(
     image_path: str | Path,
     boxes_xyxy: np.ndarray,

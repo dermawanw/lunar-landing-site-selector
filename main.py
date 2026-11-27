@@ -88,7 +88,6 @@ def main() -> None:
         else:
             if not args.nac_weights.exists():
                 raise FileNotFoundError(f"YOLO weights tidak ditemukan: {args.nac_weights}")
-            # shortcut: single-pass YOLO on full crop; tambah 640x640 tiling + NMS jika strip NAC asli >1000 px
             report = run_nac_touchdown(
                 args.nac_geotiff,
                 lat_deg=top_site.lat_deg,
@@ -96,6 +95,7 @@ def main() -> None:
                 weights_path=args.nac_weights,
                 half_span_m=args.min_radius,
                 tmp_image_path=args.out_dir / "_nac_crop_tmp.png",
+                tiled=True,
             )
             td = report.hazard.touchdown
             print(
